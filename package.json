@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-sudo",
+  "version": "0.1.0",
+  "description": "Automatic sudo password injection for opencode, backed by an encrypted machine-bound vault.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "opencode-sudo": "bin/opencode-sudo.js"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./vault": "./src/vault.js",
+    "./inject": "./src/inject.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "sudo",
+    "askpass",
+    "vault"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check": "node --check src/util.js && node --check src/paths.js && node --check src/vault.js && node --check src/inject.js && node --check src/askpass.js && node --check src/index.js && node --check bin/opencode-sudo.js",
+    "test": "node --test test/*.test.js"
+  }
+}
