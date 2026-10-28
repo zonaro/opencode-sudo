@@ -12,7 +12,7 @@
  */
 import { spawnSync } from "node:child_process"
 import readline from "node:readline"
-import { buildAskpassHelper, removeAskpassHelper } from "../src/askpass.js"
+import { ensureAskpassHelper } from "../src/helper.js"
 import { clearVault, getPassword, setPassword, vaultInfo } from "../src/vault.js"
 
 const USAGE = `opencode-sudo — encrypted sudo credentials for opencode
@@ -112,29 +112,54 @@ function commandStatus() {
 }
 
 /**
- * Run `sudo -A whoami` using a temporary askpass helper.
+ * Verify the env-based mechanism end-to-end: ensure the vault holds a
+ * password, ensure the persistent helper, then prove that plain `sudo`
+ * (no `-A`) picks it up via `SUDO_ASKPASS` in a non-tty child.
  * @returns {void}
  */
 function commandTest() {
-  const password = getPassword() || process.env.sudo_password
+  let password = getPassword()
+  if (!password) {
+    const fallback = process.env.sudo_password
+    if (fallback) {
+      try {
+        setPassword(fallback)
+        password = fallback
+      } catch (error) {
+        exit(`error: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
   if (!password) exit("error: no stored password and $sudo_password is unset")
 
-  const helper = buildAskpassHelper(password, "cli", String(process.pid))
-  try {
-    const result = spawnSync("sudo", ["-A", "-p", "", "whoami"], {
-      env: { ...process.env, SUDO_ASKPASS: helper.path },
+  const helper = ensureAskpassHelper()
+
+  spawnSync("sudo", ["-k"], { stdio: "ignore" })
+
+  /** @param {string[]} args */
+  const runWhoami = (args) => {
+    const result = spawnSync("sudo", args, {
+      env: { ...process.env, SUDO_ASKPASS: helper },
       encoding: "utf8",
     })
-    const out = (result.stdout || "").trim()
-    if (result.status === 0 && out === "root") {
-      process.stdout.write("OK — sudo accepted the stored password (whoami: root)\n")
-    } else {
-      process.stdout.write(`FAILED (exit ${result.status})\n`)
-      if (result.stderr) process.stdout.write(result.stderr)
-      process.exit(1)
+    return (result.stdout || "").trim()
+  }
+
+  // Plain sudo first: in a non-tty child this must use SUDO_ASKPASS on its
+  // own. The -A variant is checked too as a belt-and-braces fallback.
+  const plain = runWhoami(["whoami"])
+  const explicit = runWhoami(["-A", "whoami"])
+
+  if (plain.includes("root") && explicit.includes("root")) {
+    process.stdout.write("OK — sudo accepted the stored password via SUDO_ASKPASS (whoami: root)\n")
+  } else {
+    if (!plain.includes("root")) {
+      process.stdout.write(`FAILED: plain "sudo whoami" did not return root (got: ${JSON.stringify(plain)})\n`)
     }
-  } finally {
-    removeAskpassHelper(helper.path)
+    if (!explicit.includes("root")) {
+      process.stdout.write(`FAILED: "sudo -A whoami" did not return root (got: ${JSON.stringify(explicit)})\n`)
+    }
+    process.exit(1)
   }
 }
 

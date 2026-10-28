@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-sudo",
-  "version": "0.1.0",
-  "description": "Automatic sudo password injection for opencode, backed by an encrypted machine-bound vault.",
+  "version": "0.2.0",
+  "description": "Sudo password handling for OpenCode (plugin) plus a matching OpenChamber extension that configures the same password.",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -12,26 +12,52 @@
   "exports": {
     ".": "./src/index.js",
     "./vault": "./src/vault.js",
-    "./inject": "./src/inject.js"
+    "./helper": "./src/helper.js",
+    "./askpass-print": "./src/askpass-print.js",
+    "./bridge": "./src/bridge.js"
   },
   "files": [
     "src",
     "bin",
+    "panel",
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "check": "node --check src/paths.js && node --check src/vault.js && node --check src/helper.js && node --check src/askpass-print.js && node --check src/bridge.js && node --check src/index.js && node --check bin/opencode-sudo.js && node --check panel/main.js",
+    "test": "node --test test/*.test.js",
+    "build": "bun build panel/main.js --outfile panel/main.js --format=iife --target=browser",
+    "dev": "bun build panel/main.js --outfile panel/main.js --format=iife --target=browser --watch"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": { "openchamber": ">=1.24.0" },
+    "contributes": {
+      "panel": {
+        "id": "openchamber-sudo",
+        "name": "Sudo",
+        "icon": "key-line",
+        "entry": "panel/index.html"
+      },
+      "capabilities": ["filesystem"],
+      "filesystem": ["~/.config/opencode/opencode-sudo/**"]
+    }
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "^2.5.3",
+    "bun-types": "^1.4.2"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",
+    "openchamber",
+    "openchamber-extension",
     "sudo",
     "askpass",
     "vault"
   ],
   "engines": {
-    "node": ">=18"
-  },
-  "scripts": {
-    "check": "node --check src/util.js && node --check src/paths.js && node --check src/vault.js && node --check src/inject.js && node --check src/askpass.js && node --check src/index.js && node --check bin/opencode-sudo.js",
-    "test": "node --test test/*.test.js"
+    "node": ">=18",
+    "bun": ">=1.4.0"
   }
 }

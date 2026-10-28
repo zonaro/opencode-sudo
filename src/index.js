@@ -1,156 +1,130 @@
 /**
- * opencode-sudo — automatic sudo credential injection for opencode.
+ * opencode-sudo — OpenCode 2 (v2) plugin that makes plain `sudo` work inside
+ * opencode's non-tty shells.
  *
- * The plugin hooks the `bash` tool, detects commands that invoke `sudo`, and
- * rewrites them to source the password from an askpass helper backed by the
- * encrypted vault. The password is never written to the command line.
+ * Mechanism: in a non-tty environment `sudo` automatically uses the helper
+ * named by the `SUDO_ASKPASS` environment variable, so the plugin only has
+ * to export `SUDO_ASKPASS` pointing at a persistent, owner-only wrapper
+ * that decrypts the machine-bound vault. No command rewriting, no password
+ * on any command line.
+ *
+ * Password priority: `password` option > vault password > env var named by
+ * `passwordEnv` (default `sudo_password`). An option/env password is stored
+ * into the vault (idempotent) so the helper can always decrypt it from the
+ * vault alone. With no password source the plugin stays inert.
  *
  * @module opencode-sudo
  */
-import { buildAskpassHelper, cleanupRuntime, removeAskpassHelper } from "./askpass.js"
-import { rewriteSudo } from "./inject.js"
-import { getPassword, vaultInfo } from "./vault.js"
+import { ensureAskpassHelper } from "./helper.js"
+import { getPassword, setPassword } from "./vault.js"
+import { readBridgePassword } from "./bridge.js"
+
+/** @type {string} */
+const PLUGIN_ID = "opencode-sudo"
+
+const AGENT_HINT =
+  "sudo is handled automatically by the opencode-sudo plugin " +
+  "(password supplied via SUDO_ASKPASS). " +
+  "Use plain `sudo <cmd>`. " +
+  "Never use `sudo -n` (bypasses the askpass helper) and never type passwords yourself."
 
 /**
  * @typedef {object} SudoOptions
- * @property {string} [password]         Literal password (highest priority).
- * @property {string} [passwordEnv]      Env var used as fallback (default `sudo_password`).
- * @property {boolean} [enabled]         Master switch (default `true`).
- * @property {boolean} [systemPromptHint] Tell the model sudo is available (default `true`).
- * @property {boolean} [hintOnPermissionError] Append a hint on permission failures (default `true`).
+ * @property {string} [password]     Literal password (highest priority).
+ * @property {string} [passwordEnv]  Env var used as fallback (default `sudo_password`).
+ * @property {boolean} [enabled]     Master switch (default `true`).
  */
-
-/** @type {Required<Omit<SudoOptions, "password">>} */
-const DEFAULTS = {
-  passwordEnv: "sudo_password",
-  enabled: true,
-  systemPromptHint: true,
-  hintOnPermissionError: true,
-}
-
-const SYSTEM_HINT = [
-  "## sudo handling (opencode-sudo)",
-  "Elevated commands are handled automatically. When a task needs root, run the command prefixed with `sudo` (for example `sudo apt-get install -y pkg`).",
-  "Do NOT type a password and do NOT use `sudo -S` with a password: the plugin injects the stored credential through an askpass helper.",
-  "Avoid `sudo -n`, which disables the password prompt and defeats the helper.",
-].join("\n")
-
-/** Output patterns that mean "this may have needed root". */
-const PERMISSION_ERROR = /(permission denied|operation not permitted|are you root|eacces|eperm|not permitted)/i
-
-const PASSWORD_CACHE_MS = 30_000
 
 /**
- * Build the plugin hooks.
- *
- * @param {import("@opencode-ai/plugin").PluginInput} input
- * @param {SudoOptions} [options]
- * @returns {Promise<import("@opencode-ai/plugin").Hooks>}
+ * V2 plugin setup: resolve the password, persist it to the vault, ensure
+ * the helper, and export `SUDO_ASKPASS` for the server lifetime.
+ * @param {{ options?: SudoOptions, agent?: any }} ctx
+ * @returns {Promise<void>}
  */
-export const SudoPlugin = async (input, options) => {
-  const opts = { ...DEFAULTS, ...(options || {}) }
-  const client = input && input.client
+async function setup(ctx) {
+  const options = (ctx && ctx.options) || {}
+  if (options.enabled === false) return
 
-  /**
-   * @param {"debug" | "info" | "warn" | "error"} level
-   * @param {string} message
-   * @param {Record<string, unknown>} [extra]
-   */
-  const log = async (level, message, extra) => {
+  const passwordEnv =
+    typeof options.passwordEnv === "string" && options.passwordEnv.length > 0
+      ? options.passwordEnv
+      : "sudo_password"
+  const optionPassword =
+    typeof options.password === "string" && options.password.length > 0 ? options.password : null
+
+  /** @type {string | null} */
+  let vaultPassword = null
+  try {
+    vaultPassword = getPassword()
+  } catch {
+    vaultPassword = null
+  }
+
+  const envPassword =
+    passwordEnv && typeof process.env[passwordEnv] === "string" && process.env[passwordEnv]
+      ? process.env[passwordEnv]
+      : null
+
+  // Senha configurada pela extensão OpenChamber (escrita no arquivo de ponte).
+  const bridgePassword = readBridgePassword()
+
+  const resolved = optionPassword || bridgePassword || vaultPassword || envPassword || null
+  if (typeof resolved !== "string" || resolved.length === 0) return
+
+  // Persist an option/env password into the vault so the helper — which
+  // only ever reads the vault — can decrypt it. Idempotent.
+  if (resolved !== vaultPassword) {
     try {
-      await client?.app?.log?.({ body: { service: "opencode-sudo", level, message, extra } })
+      setPassword(resolved)
     } catch {
-      // Logging must never break command execution.
+      // Best effort; fall through to the readability check below.
+    }
+    try {
+      if (getPassword() == null) return
+    } catch {
+      return
     }
   }
 
-  cleanupRuntime().catch(() => {})
-
-  /** @type {string | null} */
-  let cache = null
-  let cacheAt = 0
-
-  /**
-   * Resolve the password: literal option > vault > environment fallback.
-   * @returns {Promise<string | null>}
-   */
-  const resolvePassword = async () => {
-    if (opts.password) return opts.password
-    const now = Date.now()
-    if (cache && now - cacheAt < PASSWORD_CACHE_MS) return cache
-    const fromVault = getPassword()
-    const fromEnv = opts.passwordEnv ? process.env[opts.passwordEnv] : undefined
-    cache = fromVault || fromEnv || null
-    cacheAt = now
-    return cache
+  let helper = null
+  try {
+    helper = ensureAskpassHelper()
+  } catch {
+    return
   }
+  process.env.SUDO_ASKPASS = helper
 
-  /** @type {Map<string, string>} callID -> helper path awaiting cleanup */
-  const pending = new Map()
-  /** @type {Set<string>} callIDs where we injected the helper */
-  const injected = new Set()
-
-  return {
-    "tool.execute.before": async (inp, out) => {
-      if (!opts.enabled) return
-      if (inp.tool !== "bash" && inp.tool !== "shell") return
-      const command = out?.args?.command
-      if (typeof command !== "string" || command.length === 0) return
-
-      const password = await resolvePassword()
-      if (!password) return
-
-      const helper = buildAskpassHelper(password, inp.sessionID, inp.callID)
-      const result = rewriteSudo(command, helper.path)
-      if (result.changed) {
-        out.args.command = result.command
-        pending.set(inp.callID, helper.path)
-        injected.add(inp.callID)
-        await log("debug", "Injected sudo askpass credentials", {
-          callID: inp.callID,
-          matches: result.count,
-        })
-      } else {
-        removeAskpassHelper(helper.path)
-      }
-    },
-
-    "tool.execute.after": async (inp, out) => {
-      const helperPath = pending.get(inp.callID)
-      if (helperPath) {
-        pending.delete(inp.callID)
-        removeAskpassHelper(helperPath)
-      }
-
-      const wasInjected = injected.delete(inp.callID)
-      if (
-        !wasInjected &&
-        opts.hintOnPermissionError &&
-        typeof out?.output === "string" &&
-        PERMISSION_ERROR.test(out.output)
-      ) {
-        const password = await resolvePassword()
-        if (password) {
-          out.output +=
-            "\n\n[opencode-sudo] This command failed with a permission error. If it needs root, re-run it prefixed with `sudo`; the stored password is injected automatically."
+  // Defensive agent hint: append a short note to every agent exposing a
+  // string `system` prompt. Never crash setup when shapes differ.
+  try {
+    const agent = ctx ? ctx.agent : null
+    if (agent && typeof agent.transform === "function") {
+      await agent.transform((draft) => {
+        try {
+          const ids = typeof draft.list === "function" ? draft.list() : []
+          for (const id of ids || []) {
+            try {
+              draft.update(id, (entry) => {
+                if (
+                  entry &&
+                  typeof entry.system === "string" &&
+                  !entry.system.includes("opencode-sudo")
+                ) {
+                  entry.system += `\n\n${AGENT_HINT}`
+                }
+              })
+            } catch {
+              // Ignore agents we cannot update.
+            }
+          }
+        } catch {
+          // Ignore draft shape mismatches.
         }
-      }
-    },
-
-    "experimental.chat.system.transform": async (_inp, out) => {
-      if (!opts.enabled || !opts.systemPromptHint) return
-      const info = vaultInfo()
-      const available = info.configured || Boolean(opts.passwordEnv && process.env[opts.passwordEnv])
-      if (!available) return
-      out.system.push(SYSTEM_HINT)
-    },
-
-    dispose: async () => {
-      for (const helperPath of pending.values()) removeAskpassHelper(helperPath)
-      pending.clear()
-      injected.clear()
-    },
+      })
+    }
+  } catch {
+    // Agent hints must never break the plugin.
   }
 }
 
-export default SudoPlugin
+export default { id: PLUGIN_ID, setup }

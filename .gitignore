@@ -13,4 +13,5 @@ Thumbs.db
 # Local vault scratch (never commit secrets)
 vault.json
 keystore.json
+askpass
 runtime/
